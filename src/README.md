@@ -1,4 +1,7 @@
-## Environment
+## Setup
+
+### Conda
+
 ```
 conda create -n splatter_a_video python=3.10
 conda activate splatter_a_video
@@ -15,6 +18,12 @@ python setup.py install
 ```
 
 Install [pytorch3d](https://github.com/facebookresearch/pytorch3d).
+
+### Docker
+```bash
+docker build -t splatter-a-video:local -f Dockerfile .
+docker run --rm --gpus all -it splatter-a-video:local
+```
 
 
 ## Data preparation
