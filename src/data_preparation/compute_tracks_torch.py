@@ -337,43 +337,55 @@ def main():
 
     print(f"Created dataset with {len(track_dataset)} batches")
 
-    # Process batches
-    results_cache = {}  # Cache results by (query_idx, point_start, point_end)
+    # Pre-compute grid and allocate output files once (avoid repeated load/save)
+    print("Pre-allocating output files with memory mapping...")
+    y_grid, x_grid = np.mgrid[0:height:grid_size, 0:width:grid_size]
+    y_grid = y_grid.astype(np.float32)
+    x_grid = x_grid.astype(np.float32)
+    grid_size_pts = y_grid.size  # Total grid points
+    
+    # Pre-create all output files as memory-mapped arrays
+    output_memmaps = {}  # Cache memmaps: (query_idx, target_idx) -> memmap
+    for t in range(num_frames):
+        for j in range(num_frames):
+            name_t = os.path.splitext(frame_names[t])[0]
+            name_j = os.path.splitext(frame_names[j])[0]
+            out_path = f"{out_dir}/{name_t}_{name_j}.npy"
+            
+            if not os.path.exists(out_path):
+                # Create new file with correct shape
+                arr = np.zeros((grid_size_pts, num_frames, 4), dtype=np.float32)
+                np.save(out_path, arr)
+            
+            # Open as memory-mapped array for fast access
+            output_memmaps[(t, j)] = np.load(out_path, mmap_mode='r+')
+    
+    print(f"Pre-allocated {len(output_memmaps)} output files")
 
+    # Process batches
     for batch_data in tqdm(data_loader, desc="Processing batches"):
         batch_outputs, query_indices, point_indices_list = process_batch_tracks(
             model, frames, batch_data, resize_width, resize_height, width, height, grid_size
         )
 
-        # Store results
+        # Store results directly to memory-mapped arrays (no load/save overhead)
         for i, query_idx in enumerate(query_indices):
-            batch_outputs_i = batch_outputs[i]
+            batch_outputs_i = batch_outputs[i]  # [num_points, window_len, 4]
             point_indices = point_indices_list[i]
             window_start = batch_data['window_starts'][i]
             window_end = batch_data['window_ends'][i]
-            window_len = window_end - window_start
-
-            # Save results for each target frame in this window only
-            for local_target_idx in range(window_len):
+            
+            # Write all target frames for this query in bulk
+            for local_target_idx in range(window_end - window_start):
                 target_idx = window_start + local_target_idx
-                name_query = os.path.splitext(frame_names[query_idx])[0]
-                name_target = os.path.splitext(frame_names[target_idx])[0]
-                out_path = f"{out_dir}/{name_query}_{name_target}.npy"
-
-                # Load existing results or create new array (global frame dimension)
-                if os.path.exists(out_path):
-                    existing_results = np.load(out_path)
-                    if len(existing_results) < len(point_indices):
-                        extended_results = np.zeros((len(point_indices), num_frames, 4), dtype=np.float32)
-                        extended_results[:len(existing_results)] = existing_results
-                        existing_results = extended_results
-                else:
-                    existing_results = np.zeros((len(point_indices), num_frames, 4), dtype=np.float32)
-
-                # Update with new batch window results
-                existing_results[:len(batch_outputs_i), target_idx] = batch_outputs_i[:, local_target_idx]
-                np.save(out_path, existing_results)
-
+                memmap = output_memmaps[(query_idx, target_idx)]
+                memmap[point_indices, target_idx, :] = batch_outputs_i[:, local_target_idx, :]
+    
+    # Sync all memmaps to disk
+    print("Flushing results to disk...")
+    for memmap in output_memmaps.values():
+        memmap.flush()
+    
     print("Batch processing completed!")
 
 
