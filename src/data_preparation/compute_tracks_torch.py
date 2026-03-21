@@ -10,6 +10,47 @@ from torch.utils.data import Dataset, DataLoader
 from tapnet_torch import tapir_model, transforms
 from tqdm import tqdm
 
+from torch.utils.data import Dataset, DataLoader
+
+class PointsDataset(torch.utils.data.Dataset):
+    """Dataset over all (query frame, point-chunk) pairs."""
+
+    def __init__(self, all_points, chunk_size=128):
+        self.base_points = all_points
+        self.chunk_size = chunk_size
+
+        self.point_chunks = np.array_split(
+            self.base_points,
+            indices_or_sections=max(1, int(np.ceil(len(self.base_points) / self.chunk_size))),
+            axis=0,
+        )
+        
+    def __len__(self):
+        return len(self.point_chunks)
+
+    def __getitem__(self, idx):
+        points = self.point_chunks[idx].copy()
+        points[:, 0] = float(idx)
+
+        return torch.from_numpy(points.astype(np.float32))
+    
+class FramesDataset(torch.utils.data.Dataset):
+    def __init__(self, frames, window_size=128):
+        self.frames = frames
+        self.window_size = window_size
+
+        self.frame_chunks = np.array_split(
+            self.frames,
+            indices_or_sections=max(1, int(np.ceil(len(self.frames) / self.window_size))),
+            axis=0,
+        )
+        
+    def __len__(self):
+        return len(self.frame_chunks)
+
+    def __getitem__(self, idx):
+        frame = self.frame_chunks[idx].copy()
+        return torch.from_numpy(frame.astype(np.float32))
 
 class TrackBatchDataset(Dataset):
     def __init__(self, frames, masks, frame_names, grid_size, resize_height, resize_width,
@@ -237,6 +278,10 @@ def main():
     parser.add_argument("--grid_size", type=int, default=4, help="grid size")
     parser.add_argument("--resize_height", type=int, default=256, help="resize height")
     parser.add_argument("--resize_width", type=int, default=256, help="resize width")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
+    parser.add_argument("--chunk_size", type=int, default=128, help="chunk size for points")
+    parser.add_argument("--window_size", type=int, default=128, help="window size for frames")
     parser.add_argument(
         "--model_type", type=str, choices=["tapir", "bootstapir"], help="model type"
     )
@@ -295,99 +340,62 @@ def main():
 
     video = read_video(folder_path)
     num_frames, height, width = video.shape[0:3]
-    masks = read_mask_video(mask_dir)
-    masks = (masks.reshape((num_frames, height, width, -1)) > 0).any(axis=-1)
-
-    if args.max_video_frames is not None and args.max_video_frames < num_frames:
-        print(f"Truncating video to first {args.max_video_frames} frames (from {num_frames})")
-        video = video[: args.max_video_frames]
-        masks = masks[: args.max_video_frames]
-        frame_names = frame_names[: args.max_video_frames]
-        num_frames = args.max_video_frames
-
-    print(f"{video.shape=} {masks.shape=} {masks.max()=} {masks.sum()=}")
-
-    frames = media.resize_video(video, (resize_height, resize_width))
-    print(f"{frames.shape=}")
-    frames = torch.from_numpy(frames).to(device)
-    frames = preprocess_frames(frames)[None]
-    print(f"preprocessed {frames.shape=}")
-
-    # Create batch dataset and data loader
-    track_dataset = TrackBatchDataset(
-        frames=frames,
-        masks=masks,
-        frame_names=frame_names,
-        grid_size=grid_size,
-        resize_height=resize_height,
-        resize_width=resize_width,
-        points_per_batch=args.points_per_batch,
-        max_batches_per_query=args.max_batches_per_query,
-        temporal_window=args.temporal_window
-    )
-
-    data_loader = DataLoader(
-        track_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,  # Keep order for deterministic results
-        num_workers=args.num_workers,
-        collate_fn=collate_track_batch,
-        pin_memory=True
-    )
-
-    print(f"Created dataset with {len(track_dataset)} batches")
-
-    # Pre-compute grid and allocate output files once (avoid repeated load/save)
-    print("Pre-allocating output files with memory mapping...")
-    y_grid, x_grid = np.mgrid[0:height:grid_size, 0:width:grid_size]
-    y_grid = y_grid.astype(np.float32)
-    x_grid = x_grid.astype(np.float32)
-    grid_size_pts = y_grid.size  # Total grid points
     
-    # Pre-create all output files as memory-mapped arrays
-    output_memmaps = {}  # Cache memmaps: (query_idx, target_idx) -> memmap
+    frames = media.resize_video(video, (resize_height, resize_width))
+    frames = torch.from_numpy(frames)
+    frames = preprocess_frames(frames)
+
+
+    y, x = np.mgrid[0:height:grid_size, 0:width:grid_size]
+    y_resize = y / (height - 1) * (resize_height - 1)
+    x_resize = x / (width - 1) * (resize_width - 1)
+
+    all_points = np.stack([np.zeros_like(y, dtype=np.float32), y_resize, x_resize], axis=-1)
+    
+    points_dataset = PointsDataset(all_points, chunk_size=args.chunk_size)
+    frames_dataset = FramesDataset(frames, window_size=args.window_size)
+
+    points_loader = DataLoader(
+        points_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers if hasattr(args, 'num_workers') else 0,
+    )
+
+    outputs_per_frame = [np.zeros((len(all_points), num_frames, 4), dtype=np.float32) for _ in range(num_frames)]
+    for t in range(num_frames):
+        name_t = os.path.splitext(frame_names[t])[0]
+        outputs = []
+        
+        for points in tqdm(points_loader, desc=f"Processing frame {t}/{num_frames}"):
+            points = points.to(device) * t 
+            batch_output = []
+            
+            for frames_chunk in tqdm(frames_dataset, desc=f"Processing frames for frame {t}"):
+                frames_chunk = frames_chunk.to(device)
+                frames_chunk = frames_chunk.unsqueeze(0).repeat(points.shape[0], 1, 1, 1, 1)
+
+                with torch.inference_mode():
+                    preds = model(frames_chunk, points)
+
+                tracks = preds["tracks"].detach().cpu().numpy()
+                tracks = transforms.convert_grid_coordinates(
+                    tracks, (resize_width - 1, resize_height - 1), (width - 1, height - 1)
+                )
+                occlusions = preds["occlusion"].detach().cpu().numpy()
+                expected_dist = preds["expected_dist"].detach().cpu().numpy()
+                
+                batch_output.append(np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1))
+            
+        outputs.append(np.concatenate(batch_output, axis=2)) 
+        outputs = np.concatenate(outputs, axis=0)
+
     for t in range(num_frames):
         for j in range(num_frames):
-            name_t = os.path.splitext(frame_names[t])[0]
             name_j = os.path.splitext(frame_names[j])[0]
-            out_path = f"{out_dir}/{name_t}_{name_j}.npy"
+            if j == t:
+                outputs_per_frame[t][:, j, :2] = np.stack([x.reshape(-1), y.reshape(-1)], axis=-1)
+            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs_per_frame[t][:, j])
             
-            if not os.path.exists(out_path):
-                # Create new file with correct shape
-                arr = np.zeros((grid_size_pts, num_frames, 4), dtype=np.float32)
-                np.save(out_path, arr)
-            
-            # Open as memory-mapped array for fast access
-            output_memmaps[(t, j)] = np.load(out_path, mmap_mode='r+')
-    
-    print(f"Pre-allocated {len(output_memmaps)} output files")
-
-    # Process batches
-    for batch_data in tqdm(data_loader, desc="Processing batches"):
-        batch_outputs, query_indices, point_indices_list = process_batch_tracks(
-            model, frames, batch_data, resize_width, resize_height, width, height, grid_size
-        )
-
-        # Store results directly to memory-mapped arrays (no load/save overhead)
-        for i, query_idx in enumerate(query_indices):
-            batch_outputs_i = batch_outputs[i]  # [num_points, window_len, 4]
-            point_indices = point_indices_list[i]
-            window_start = batch_data['window_starts'][i]
-            window_end = batch_data['window_ends'][i]
-            
-            # Write all target frames for this query in bulk
-            for local_target_idx in range(window_end - window_start):
-                target_idx = window_start + local_target_idx
-                memmap = output_memmaps[(query_idx, target_idx)]
-                memmap[point_indices, target_idx, :] = batch_outputs_i[:, local_target_idx, :]
-    
-    # Sync all memmaps to disk
-    print("Flushing results to disk...")
-    for memmap in output_memmaps.values():
-        memmap.flush()
-    
-    print("Batch processing completed!")
-
-
 if __name__ == "__main__":
     main()
