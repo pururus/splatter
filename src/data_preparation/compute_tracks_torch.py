@@ -9,6 +9,47 @@ import torch
 from tapnet_torch import tapir_model, transforms
 from tqdm import tqdm
 
+from torch.utils.data import Dataset, DataLoader
+
+class PointsDataset(torch.utils.data.Dataset):
+    """Dataset over all (query frame, point-chunk) pairs."""
+
+    def __init__(self, all_points, chunk_size=128):
+        self.base_points = all_points
+        self.chunk_size = chunk_size
+
+        self.point_chunks = np.array_split(
+            self.base_points,
+            indices_or_sections=max(1, int(np.ceil(len(self.base_points) / self.chunk_size))),
+            axis=0,
+        )
+        
+    def __len__(self):
+        return len(self.point_chunks)
+
+    def __getitem__(self, idx):
+        points = self.point_chunks[idx].copy()
+        points[:, 0] = float(idx)
+
+        return torch.from_numpy(points.astype(np.float32))
+    
+class FramesDataset(torch.utils.data.Dataset):
+    def __init__(self, frames, window_size=128):
+        self.frames = frames
+        self.window_size = window_size
+
+        self.frame_chunks = np.array_split(
+            self.frames,
+            indices_or_sections=max(1, int(np.ceil(len(self.frames) / self.window_size))),
+            axis=0,
+        )
+        
+    def __len__(self):
+        return len(self.frame_chunks)
+
+    def __getitem__(self, idx):
+        frame = self.frame_chunks[idx].copy()
+        return torch.from_numpy(frame.astype(np.float32))
 
 def read_video(folder_path):
     frame_paths = sorted(glob.glob(os.path.join(folder_path, "*")))
@@ -49,6 +90,10 @@ def main():
     parser.add_argument("--grid_size", type=int, default=4, help="grid size")
     parser.add_argument("--resize_height", type=int, default=256, help="resize height")
     parser.add_argument("--resize_width", type=int, default=256, help="resize width")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
+    parser.add_argument("--chunk_size", type=int, default=128, help="chunk size for points")
+    parser.add_argument("--window_size", type=int, default=128, help="window size for frames")
     parser.add_argument(
         "--model_type", type=str, choices=["tapir", "bootstapir"], help="model type"
     )
@@ -100,70 +145,60 @@ def main():
 
     video = read_video(folder_path)
     num_frames, height, width = video.shape[0:3]
-    masks = read_mask_video(mask_dir)
-    masks = (masks.reshape((num_frames, height, width, -1)) > 0).any(axis=-1)
-    print(f"{video.shape=} {masks.shape=} {masks.max()=} {masks.sum()=}")
 
     frames = media.resize_video(video, (resize_height, resize_width))
-    print(f"{frames.shape=}")
-    frames = torch.from_numpy(frames).to(device)
-    frames = preprocess_frames(frames)[None]
-    print(f"preprocessed {frames.shape=}")
+    frames = torch.from_numpy(frames)
+    frames = preprocess_frames(frames)
 
     y, x = np.mgrid[0:height:grid_size, 0:width:grid_size]
-    y_resize, x_resize = y / (height - 1) * (resize_height - 1), x / (width - 1) * (
-        resize_width - 1
+    y_resize = y / (height - 1) * (resize_height - 1)
+    x_resize = x / (width - 1) * (resize_width - 1)
+
+    all_points = np.stack([np.zeros_like(y, dtype=np.float32), y_resize, x_resize], axis=-1)
+    
+    points_dataset = PointsDataset(all_points, chunk_size=args.chunk_size)
+    frames_dataset = FramesDataset(frames, window_size=args.window_size)
+
+    points_loader = DataLoader(
+        points_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers if hasattr(args, 'num_workers') else 0,
     )
 
-    for t in tqdm(range(num_frames), desc="query frames"):
+    outputs_per_frame = [np.zeros((len(all_points), num_frames, 4), dtype=np.float32) for _ in range(num_frames)]
+    for t in range(num_frames):
         name_t = os.path.splitext(frame_names[t])[0]
-        file_matches = glob.glob(f"{out_dir}/{name_t}_*.npy")
-        if len(file_matches) == num_frames:
-            print(f"Already computed tracks with query {t=} {name_t=}")
-            continue
-
-        all_points = np.stack([t * np.ones_like(y), y_resize, x_resize], axis=-1)
-        mask = masks[t]
-        ### TODO add argument to mask points
-        in_mask = mask[y, x] > 0.5
-        all_points_t = all_points[in_mask]
-        print(f"{all_points.shape=} {all_points_t.shape=} {t=}")
         outputs = []
-        if len(all_points_t) > 0:
-            num_chunks = max(1, len(all_points_t) // 128)
-            for points in tqdm(
-                np.array_split(all_points_t, axis=0, indices_or_sections=num_chunks),
-                leave=False,
-                desc="points",
-            ):
-                points = torch.from_numpy(points.astype(np.float32))[None].to(
-                    device
-                )  # Add batch dimension
+        
+        for points in tqdm(points_loader, desc=f"Processing frame {t}/{num_frames}"):
+            points = points.to(device) * t 
+            batch_output = []
+            
+            for frames_chunk in tqdm(frames_dataset, desc=f"Processing frames for frame {t}"):
+                frames_chunk = frames_chunk.to(device)
+                frames_chunk = frames_chunk.unsqueeze(0).repeat(points.shape[0], 1, 1, 1, 1)
+
                 with torch.inference_mode():
-                    preds = model(frames, points)
-                tracks, occlusions, expected_dist = (
-                    preds["tracks"][0].detach().cpu().numpy(),
-                    preds["occlusion"][0].detach().cpu().numpy(),
-                    preds["expected_dist"][0].detach().cpu().numpy(),
-                )
+                    preds = model(frames_chunk, points)
+
+                tracks = preds["tracks"].detach().cpu().numpy()
                 tracks = transforms.convert_grid_coordinates(
                     tracks, (resize_width - 1, resize_height - 1), (width - 1, height - 1)
                 )
-                outputs.append(
-                    np.concatenate(
-                        [tracks, occlusions[..., None], expected_dist[..., None]], axis=-1
-                    )
-                )
-            outputs = np.concatenate(outputs, axis=0)
-        else:
-            outputs = np.zeros((0, num_frames, 4), dtype=np.float32)
+                occlusions = preds["occlusion"].detach().cpu().numpy()
+                expected_dist = preds["expected_dist"].detach().cpu().numpy()
+                
+                batch_output.append(np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1))
+            
+        outputs.append(np.concatenate(batch_output, axis=2)) 
+        outputs = np.concatenate(outputs, axis=0)
 
         for j in range(num_frames):
-            if j == t:
-                original_query_points = np.stack([x[in_mask], y[in_mask]], axis=-1)
-                outputs[:, j, :2] = original_query_points
             name_j = os.path.splitext(frame_names[j])[0]
-            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs[:, j])
+            if j == t:
+                outputs_per_frame[t][:, j, :2] = np.stack([x.reshape(-1), y.reshape(-1)], axis=-1)
+            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs_per_frame[t][:, j])
 
 
 if __name__ == "__main__":
