@@ -133,62 +133,68 @@ def collate_track_batch(batch):
 
 
 def process_batch_tracks(model, frames, batch_data, resize_width, resize_height, width, height, grid_size):
-    """Process a batch of track queries."""
-    points = batch_data['points'].to(frames.device)
-
-    # Determine the union of windows in batch for efficient frame slicing
+    """Process a batch of track queries efficiently (single model call, vectorized post-processing)."""
+    points = batch_data['points'].to(frames.device)  # [B, num_points, 3]
+    batch_size = points.shape[0]
+    
+    # Determine union of windows for frame slicing
     window_start = min(batch_data['window_starts'])
     window_end = max(batch_data['window_ends'])
-    frames_window = frames[:, window_start:window_end]
-
-    # Points already use local window time from dataset __getitem__()
+    frames_window = frames[:, window_start:window_end]  # [1, window_len, H, W, 3]
+    
+    # Expand frames batch dimension to match points batch size [B, window_len, H, W, 3]
+    frames_batch = frames_window.expand(batch_size, -1, -1, -1, -1)
+    
+    # Single model call with full batch
     with torch.inference_mode():
-        preds = model(frames_window, points)
-
-    tracks, occlusions, expected_dist = (
-        preds["tracks"].detach().cpu().numpy(),
-        preds["occlusion"].detach().cpu().numpy(),
-        preds["expected_dist"].detach().cpu().numpy(),
-    )
-
-    # Convert coordinates back to original size
-    tracks = transforms.convert_grid_coordinates(
-        tracks, (resize_width - 1, resize_height - 1), (width - 1, height - 1)
-    )
-
+        preds = model(frames_batch, points)
+    
+    tracks = preds["tracks"].detach().cpu().numpy()  # [B, num_points, window_len, 2]
+    occlusions = preds["occlusion"].detach().cpu().numpy()  # [B, num_points, window_len]
+    expected_dist = preds["expected_dist"].detach().cpu().numpy()  # [B, num_points, window_len]
+    
+    # Vectorized coordinate conversion: flatten, convert, reshape
+    batch_size_actual, num_points_actual, window_len, coord_dim = tracks.shape
+    tracks_flat = tracks.reshape(-1, coord_dim)
+    tracks_converted = transforms.convert_grid_coordinates(
+        tracks_flat[None],
+        (resize_width - 1, resize_height - 1),
+        (width - 1, height - 1)
+    )[0]
+    tracks = tracks_converted.reshape(batch_size_actual, num_points_actual, window_len, coord_dim)
+    
+    # Pre-compute grid once (not per-item)
+    y_grid, x_grid = np.mgrid[0:height:grid_size, 0:width:grid_size]
+    y_grid = y_grid.astype(np.float32)
+    x_grid = x_grid.astype(np.float32)
+    y_grid_ravel = y_grid.ravel()
+    x_grid_ravel = x_grid.ravel()
+    
     # Combine outputs
     batch_outputs = []
-    for i in range(len(batch_data['query_indices'])):
+    for i in range(batch_size):
         query_idx = batch_data['query_indices'][i]
         batch_tracks = tracks[i]
         batch_occlusions = occlusions[i]
         batch_expected_dist = expected_dist[i]
-
-        # Reconstruct original grid coordinates for this batch
-        # Get the global grid for this query frame
-        y_grid, x_grid = np.mgrid[0:height:grid_size, 0:width:grid_size]
-        y_grid = y_grid.astype(np.float32)
-        x_grid = x_grid.astype(np.float32)
-
-        # Get valid points for this query frame
-        mask = np.ones_like(y_grid, dtype=bool)  # We'll filter in the dataset
-        valid_y = y_grid.ravel()[batch_data['point_indices'][i]]
-        valid_x = x_grid.ravel()[batch_data['point_indices'][i]]
-
+        
+        # Get valid points using pre-computed grid
+        valid_y = y_grid_ravel[batch_data['point_indices'][i]]
+        valid_x = x_grid_ravel[batch_data['point_indices'][i]]
+        
         # Set query frame coordinates to original grid positions
-        # query_idx is global; in tracks it is shifted by batch window_start
         local_query_idx = query_idx - window_start
-        batch_tracks[:, local_query_idx, 0] = valid_y  # y coordinates
-        batch_tracks[:, local_query_idx, 1] = valid_x  # x coordinates
-
+        batch_tracks[:, local_query_idx, 0] = valid_y
+        batch_tracks[:, local_query_idx, 1] = valid_x
+        
         combined = np.concatenate([
             batch_tracks,
             batch_occlusions[..., None],
             batch_expected_dist[..., None]
         ], axis=-1)
-
+        
         batch_outputs.append(combined)
-
+    
     return batch_outputs, batch_data['query_indices'], batch_data['point_indices']
 
 
