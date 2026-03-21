@@ -254,8 +254,8 @@ class FragTrainer:
 
     
     def read_data_simple(self):
-        # self.seq_dir = 
-        self.img_dir = "/mnt/sda/syt/dataset/laptop_10211/processed/images"
+        self.seq_dir = self.args.data_dir
+        self.img_dir = os.path.join(self.seq_dir, 'images')
         self.seq_name = self.args.seq_name
         img_files = sorted(glob.glob(os.path.join(self.img_dir, '*')))
         if self.args.num_imgs < 0:
@@ -277,19 +277,19 @@ class FragTrainer:
 
         ### load depth
         if True:
-        #     self.depth_dir = "/mnt/sda/syt/dataset/laptop_10211/processed/aligned_depth_anything_v2"
-        #     depth_files = sorted(glob.glob(os.path.join(self.depth_dir, '*.npy')))[self.base_idx:self.num_imgs+self.base_idx]
-        #     depth = [np.load(depth_file) for depth_file in depth_files]
-        #     depth = [1.0 / np.clip(x, a_min=1e-6, a_max=1e6) for x in depth]
-        #     self.gt_depths = torch.from_numpy(np.array(depth)).float().to(self.device)  # [n_imgs, h, w]
-            self.depth_dir = "/mnt/sda/syt/dataset/laptop_10211/processed/marigold/depth_npy"
+            self.depth_dir = os.path.join(self.seq_dir, "aligned_depth_anything_v2")
             depth_files = sorted(glob.glob(os.path.join(self.depth_dir, '*.npy')))[self.base_idx:self.num_imgs+self.base_idx]
-            depth = np.array([np.load(depth_file) for depth_file in depth_files])
-            self.gt_depths = torch.from_numpy(depth).float().to(self.device)  # [n_imgs, h, w]
+            depth = [np.load(depth_file) for depth_file in depth_files]
+            depth = [1.0 / np.clip(x, a_min=1e-6, a_max=1e6) for x in depth]
+            self.gt_depths = torch.from_numpy(np.array(depth)).float().to(self.device)  # [n_imgs, h, w]
+            # self.depth_dir = "/mnt/sda/syt/dataset/laptop_10211/processed/marigold/depth_npy"
+            # depth_files = sorted(glob.glob(os.path.join(self.depth_dir, '*.npy')))[self.base_idx:self.num_imgs+self.base_idx]
+            # depth = np.array([np.load(depth_file) for depth_file in depth_files])
+            # self.gt_depths = torch.from_numpy(depth).float().to(self.device)  # [n_imgs, h, w]
 
         ### load mask
         if True:
-            self.mask_dir = "/mnt/sda/syt/dataset/laptop_10211/processed/masks"
+            self.mask_dir = os.path.join(self.seq_dir, "masks")
             mask_files = sorted(glob.glob(os.path.join(self.mask_dir, '*.png')))[self.base_idx:self.num_imgs+self.base_idx]
             masks = np.array([imageio.imread(mask_file)/255. for mask_file in mask_files])
             if masks.ndim == 4:
@@ -299,10 +299,10 @@ class FragTrainer:
         self.grid = util.gen_grid(self.h, self.w, device=self.device, normalize=False, homogeneous=True).float()
 
         ### load 3D flow
-        depth_folder = "/mnt/sda/syt/dataset/laptop_10211/processed/aligned_depth_anything_v2"
-        tracking_folder = "/mnt/sda/syt/dataset/laptop_10211/processed/bootstapir"
-        frames_folder = "/mnt/sda/syt/dataset/laptop_10211/processed/images"
-        mask_folder = "/mnt/sda/syt/dataset/laptop_10211/processed/masks"
+        depth_folder = os.path.join(self.seq_dir, "aligned_depth_anything_v2")
+        tracking_folder = os.path.join(self.seq_dir, "bootstapir")
+        frames_folder = os.path.join(self.seq_dir, "images")
+        mask_folder = os.path.join(self.seq_dir, "masks")
         from video3Dflow.video_3d_flow import Video3DFlow
         self.video_3d_flow = Video3DFlow(depth_folder, tracking_folder, frames_folder, mask_folder)
         self.video_3d_flow.setup()
@@ -558,7 +558,7 @@ class FragTrainer:
             masks_flatten.reshape(-1, self.h * self.w) > 0.5
         )
         predicted_track_2d = predicted_track_2d.reshape(-1, self.h * self.w, 2)
-        if len(predicted_track_2d[masks_flatten][gt_visibles]) > 0:
+        if len(predicted_track_2d[masks_flatten]) == len(gt_visibles) and len(predicted_track_2d[masks_flatten][gt_visibles]) > 0:
             optical_flow_loss = masked_l1_loss(
                 predicted_track_2d[masks_flatten][gt_visibles],
                 gt_tracks_2d[gt_visibles],
@@ -1261,6 +1261,68 @@ class FragTrainer:
         print()
 
 
+    def render_video_nvs(self, step=0, save_frames=False, phi=math.pi, theta=math.pi, radius=0.05):
+        ### render image / depth / dinov2
+        images, depths = [], []
+        dinos = []
+        for id in range(self.num_imgs):
+            camera_position = torch.tensor([[radius*math.cos(phi)*math.cos(theta), radius*math.sin(phi)*math.cos(theta), radius*math.sin(theta)]], device=self.device)
+            camra_rotation = look_at_rotation(camera_position, at=((0,0,2.5),), device=self.device)
+            c2w = torch.cat([camra_rotation[0], camera_position.T], dim=1).cpu().numpy()
+            c2w = np.concatenate([c2w, np.array([[0,0,0,1]])], axis=0)
+            camera = construct_canonical_camera(width=self.w, height=self.h, c2w=c2w)
+            
+            batch_dict = {
+                "camera": camera,
+                "FovX": camera.fovX,
+                "FovY": camera.fovY,
+                "height": int(camera.image_height),
+                "width": int(camera.image_width),
+                "world_view_transform": camera.world_view_transform,
+                "full_proj_transform": camera.full_proj_transform,
+                "extrinsic_matrix": camera.extrinsic_matrix,
+                "intrinsic_matrix": camera.intrinsic_matrix,
+                "camera_center": camera.camera_center,
+            }
+            with torch.no_grad():
+                render_dict = self.gs_atlases_model.forward(id)
+                batch_dict_copy = batch_dict.copy()
+                batch_dict_copy.update({"render_attributes_list" : ['dino_attribute', 'mask_attribute']})
+                render_results = self.renderer.render_batch(render_dict, [batch_dict_copy])
+                pred_rgb = render_results['rgb'][0].clamp(0,1).permute(1,2,0).cpu().numpy()
+                pred_depth = render_results['depth'][0].permute(1,2,0).cpu().numpy()
+                pred_dino = render_results['dino_attribute'][0].permute(1,2,0).cpu().numpy()
+            images.append((pred_rgb*255).astype(np.uint8))
+            depths.append(pred_depth)
+            dinos.append((pred_dino*255).astype(np.uint8))
+        
+        from util import colorize_np
+        depths = np.stack(depths, axis=0).squeeze()
+        depth_max, depth_min = depths.max(), depths.min()
+        normed_depth = [colorize_np(x, cmap_name="jet", 
+                                    mask=None, range=(depth_min,depth_max), 
+                                    append_cbar=False, 
+                                    cbar_in_image=False) for x in depths]
+        normed_depth = [(x*255).astype(np.uint8) for x in normed_depth]
+
+        if save_frames:
+            save_dir = os.path.join(self.out_dir, 'vis', 'frames_{:06d}'.format(step))
+            os.makedirs(save_dir, exist_ok=True)
+            for i, img in enumerate(images):
+                imageio.imwrite(os.path.join(save_dir, f'{i:05d}.png'), img)
+        
+        imageio.mimwrite(os.path.join(self.out_dir, 'vis', 'render_{:06d}_nvs.mp4'.format(step)),
+                            images,
+                            quality=8, fps=10)
+        
+        # imageio.mimwrite(os.path.join(self.out_dir, 'vis', 'depth_{:06d}.mp4'.format(step)),
+        #                     normed_depth,
+        #                     quality=8, fps=10)
+        # imageio.mimwrite(os.path.join(self.out_dir, 'vis', 'dino_{:06d}.mp4'.format(step)),
+        #                     dinos,
+        #                     quality=8, fps=10)
+        print()
+
     def render_video(self, step=0, save_frames=False):
         ### render image / depth / dinov2
         images, depths = [], []
@@ -1304,8 +1366,6 @@ class FragTrainer:
         #                     dinos,
         #                     quality=8, fps=10)
         print()
-
-
     
     def render_part(self, fg=True, threshold=0.5):
         """
