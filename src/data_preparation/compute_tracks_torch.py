@@ -91,15 +91,14 @@ class TrackBatchDataset(Dataset):
         sample = self.samples[idx]
         query_idx = sample['query_idx']
 
-        # Create track queries for windowed frames, not full video, for memory efficiency.
-        num_frames = len(self.frame_names)
+        # Create track queries for the current query frame only.
         window_start = sample['window_start']
-        window_end = sample['window_end']
-        window_len = window_end - window_start
+        # (In the model, query time should be local to window_start)
+        local_query_t = query_idx - window_start
 
-        all_points = np.zeros((len(sample['points']), window_len, 3), dtype=np.float32)
-        all_points[:, :, 0] = np.arange(window_start, window_end)[None, :]
-        all_points[:, :, 1:] = np.repeat(sample['points'][:, None, :], window_len, axis=1)
+        all_points = np.zeros((len(sample['points']), 3), dtype=np.float32)
+        all_points[:, 0] = local_query_t  # time (in window coordinates)
+        all_points[:, 1:] = sample['points']  # y, x coordinates (resized coords)
 
         return {
             'query_idx': query_idx,
@@ -108,7 +107,7 @@ class TrackBatchDataset(Dataset):
             'batch_start': sample['batch_start'],
             'batch_end': sample['batch_end'],
             'window_start': window_start,
-            'window_end': window_end
+            'window_end': sample['window_end']
         }
 
 
@@ -142,10 +141,7 @@ def process_batch_tracks(model, frames, batch_data, resize_width, resize_height,
     window_end = max(batch_data['window_ends'])
     frames_window = frames[:, window_start:window_end]
 
-    # Convert point timestamps to local window coordinates expected by model
-    points = points.clone()
-    points[..., 0] = points[..., 0] - window_start
-
+    # Points already use local window time from dataset __getitem__()
     with torch.inference_mode():
         preds = model(frames_window, points)
 
