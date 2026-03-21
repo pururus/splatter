@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 class TrackBatchDataset(Dataset):
     def __init__(self, frames, masks, frame_names, grid_size, resize_height, resize_width,
-                 points_per_batch=128, max_batches_per_query=None):
+                 points_per_batch=128, max_batches_per_query=None, temporal_window=None):
         """
         Args:
             frames: Preprocessed frames tensor [num_frames, height, width, 3]
@@ -23,6 +23,7 @@ class TrackBatchDataset(Dataset):
             resize_height, resize_width: Target dimensions
             points_per_batch: Number of points per batch
             max_batches_per_query: Maximum batches per query frame (for memory control)
+            temporal_window: Number of frames to keep in each sample track window
         """
         self.frames = frames
         self.masks = masks
@@ -32,6 +33,7 @@ class TrackBatchDataset(Dataset):
         self.resize_width = resize_width
         self.points_per_batch = points_per_batch
         self.max_batches_per_query = max_batches_per_query
+        self.temporal_window = temporal_window
 
         # Pre-compute grid points
         num_frames, height, width = masks.shape
@@ -62,12 +64,24 @@ class TrackBatchDataset(Dataset):
                 batch_points = query_points[i:end_idx]
                 batch_indices = point_indices[i:end_idx]
 
+                # Determine window around query frame (for memory control)
+                if self.temporal_window is None or self.temporal_window >= num_frames:
+                    window_start = 0
+                    window_end = num_frames
+                else:
+                    half_window = self.temporal_window // 2
+                    window_start = max(0, query_idx - half_window)
+                    window_end = min(num_frames, window_start + self.temporal_window)
+                    window_start = max(0, window_end - self.temporal_window)
+
                 self.samples.append({
                     'query_idx': query_idx,
                     'point_indices': batch_indices,
                     'points': batch_points,
                     'batch_start': i,
-                    'batch_end': end_idx
+                    'batch_end': end_idx,
+                    'window_start': window_start,
+                    'window_end': window_end
                 })
 
     def __len__(self):
@@ -77,18 +91,24 @@ class TrackBatchDataset(Dataset):
         sample = self.samples[idx]
         query_idx = sample['query_idx']
 
-        # Create full track queries for all frames
+        # Create track queries for windowed frames, not full video, for memory efficiency.
         num_frames = len(self.frame_names)
-        all_points = np.zeros((len(sample['points']), num_frames, 3), dtype=np.float32)
-        all_points[:, query_idx, 0] = query_idx  # time
-        all_points[:, query_idx, 1:] = sample['points']  # y, x coordinates
+        window_start = sample['window_start']
+        window_end = sample['window_end']
+        window_len = window_end - window_start
+
+        all_points = np.zeros((len(sample['points']), window_len, 3), dtype=np.float32)
+        all_points[:, :, 0] = np.arange(window_start, window_end)[None, :]
+        all_points[:, :, 1:] = np.repeat(sample['points'][:, None, :], window_len, axis=1)
 
         return {
             'query_idx': query_idx,
             'point_indices': sample['point_indices'],
             'points': torch.from_numpy(all_points),
             'batch_start': sample['batch_start'],
-            'batch_end': sample['batch_end']
+            'batch_end': sample['batch_end'],
+            'window_start': window_start,
+            'window_end': window_end
         }
 
 
@@ -99,13 +119,17 @@ def collate_track_batch(batch):
     points = torch.stack([item['points'] for item in batch])
     batch_starts = [item['batch_start'] for item in batch]
     batch_ends = [item['batch_end'] for item in batch]
+    window_starts = [item['window_start'] for item in batch]
+    window_ends = [item['window_end'] for item in batch]
 
     return {
         'query_indices': query_indices,
         'point_indices': point_indices,
         'points': points,
         'batch_starts': batch_starts,
-        'batch_ends': batch_ends
+        'batch_ends': batch_ends,
+        'window_starts': window_starts,
+        'window_ends': window_ends
     }
 
 
@@ -113,8 +137,17 @@ def process_batch_tracks(model, frames, batch_data, resize_width, resize_height,
     """Process a batch of track queries."""
     points = batch_data['points'].to(frames.device)
 
+    # Determine the union of windows in batch for efficient frame slicing
+    window_start = min(batch_data['window_starts'])
+    window_end = max(batch_data['window_ends'])
+    frames_window = frames[:, window_start:window_end]
+
+    # Convert point timestamps to local window coordinates expected by model
+    points = points.clone()
+    points[..., 0] = points[..., 0] - window_start
+
     with torch.inference_mode():
-        preds = model(frames, points)
+        preds = model(frames_window, points)
 
     tracks, occlusions, expected_dist = (
         preds["tracks"].detach().cpu().numpy(),
@@ -147,8 +180,10 @@ def process_batch_tracks(model, frames, batch_data, resize_width, resize_height,
         valid_x = x_grid.ravel()[batch_data['point_indices'][i]]
 
         # Set query frame coordinates to original grid positions
-        batch_tracks[:, query_idx, 0] = valid_y  # y coordinates
-        batch_tracks[:, query_idx, 1] = valid_x  # x coordinates
+        # query_idx is global; in tracks it is shifted by batch window_start
+        local_query_idx = query_idx - window_start
+        batch_tracks[:, local_query_idx, 0] = valid_y  # y coordinates
+        batch_tracks[:, local_query_idx, 1] = valid_x  # x coordinates
 
         combined = np.concatenate([
             batch_tracks,
@@ -214,6 +249,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=2, help="number of workers for data loader")
     parser.add_argument("--points_per_batch", type=int, default=128, help="points per batch")
     parser.add_argument("--max_batches_per_query", type=int, default=None, help="max batches per query frame")
+    parser.add_argument("--max_video_frames", type=int, default=None, help="truncate video to this many frames before computing tracks")
+    parser.add_argument("--temporal_window", type=int, default=None, help="number of frames to process in each track window; if None uses full sequence")
     args = parser.parse_args()
 
     folder_path = args.image_dir
@@ -258,6 +295,14 @@ def main():
     num_frames, height, width = video.shape[0:3]
     masks = read_mask_video(mask_dir)
     masks = (masks.reshape((num_frames, height, width, -1)) > 0).any(axis=-1)
+
+    if args.max_video_frames is not None and args.max_video_frames < num_frames:
+        print(f"Truncating video to first {args.max_video_frames} frames (from {num_frames})")
+        video = video[: args.max_video_frames]
+        masks = masks[: args.max_video_frames]
+        frame_names = frame_names[: args.max_video_frames]
+        num_frames = args.max_video_frames
+
     print(f"{video.shape=} {masks.shape=} {masks.max()=} {masks.sum()=}")
 
     frames = media.resize_video(video, (resize_height, resize_width))
@@ -275,7 +320,8 @@ def main():
         resize_height=resize_height,
         resize_width=resize_width,
         points_per_batch=args.points_per_batch,
-        max_batches_per_query=args.max_batches_per_query
+        max_batches_per_query=args.max_batches_per_query,
+        temporal_window=args.temporal_window
     )
 
     data_loader = DataLoader(
@@ -301,17 +347,20 @@ def main():
         for i, query_idx in enumerate(query_indices):
             batch_outputs_i = batch_outputs[i]
             point_indices = point_indices_list[i]
+            window_start = batch_data['window_starts'][i]
+            window_end = batch_data['window_ends'][i]
+            window_len = window_end - window_start
 
-            # Save results for each target frame
-            for target_idx in range(num_frames):
+            # Save results for each target frame in this window only
+            for local_target_idx in range(window_len):
+                target_idx = window_start + local_target_idx
                 name_query = os.path.splitext(frame_names[query_idx])[0]
                 name_target = os.path.splitext(frame_names[target_idx])[0]
                 out_path = f"{out_dir}/{name_query}_{name_target}.npy"
 
-                # Load existing results or create new array
+                # Load existing results or create new array (global frame dimension)
                 if os.path.exists(out_path):
                     existing_results = np.load(out_path)
-                    # Extend array if needed
                     if len(existing_results) < len(point_indices):
                         extended_results = np.zeros((len(point_indices), num_frames, 4), dtype=np.float32)
                         extended_results[:len(existing_results)] = existing_results
@@ -319,8 +368,8 @@ def main():
                 else:
                     existing_results = np.zeros((len(point_indices), num_frames, 4), dtype=np.float32)
 
-                # Update with new batch results
-                existing_results[:len(batch_outputs_i), target_idx] = batch_outputs_i[:, target_idx]
+                # Update with new batch window results
+                existing_results[:len(batch_outputs_i), target_idx] = batch_outputs_i[:, local_target_idx]
                 np.save(out_path, existing_results)
 
     print("Batch processing completed!")
