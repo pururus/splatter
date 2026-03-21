@@ -917,7 +917,7 @@ class FragTrainer:
 
                 ### save video render result
                 self.render_video(step, save_frames=True)
-
+                self.render_video_nvs(step, save_frames=True)
                 # self.render_part(fg=True, threshold=0.5)
                 # self.render_part(fg=False, threshold=0.5)
                 

@@ -1,7 +1,7 @@
 expname = exp
 dataset_types = simpleGS
 gui = False
-data_dir = /mnt/sda/syt/dataset/DAVIS_processed
+data_dir = /app/root_data
 
 # training
 num_pairs = 1

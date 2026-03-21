@@ -6,8 +6,159 @@ import imageio
 import mediapy as media
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
 from tapnet_torch import tapir_model, transforms
 from tqdm import tqdm
+
+
+class TrackBatchDataset(Dataset):
+    def __init__(self, frames, masks, frame_names, grid_size, resize_height, resize_width,
+                 points_per_batch=128, max_batches_per_query=None):
+        """
+        Args:
+            frames: Preprocessed frames tensor [num_frames, height, width, 3]
+            masks: Mask tensor [num_frames, height, width]
+            frame_names: List of frame names
+            grid_size: Grid spacing for point sampling
+            resize_height, resize_width: Target dimensions
+            points_per_batch: Number of points per batch
+            max_batches_per_query: Maximum batches per query frame (for memory control)
+        """
+        self.frames = frames
+        self.masks = masks
+        self.frame_names = frame_names
+        self.grid_size = grid_size
+        self.resize_height = resize_height
+        self.resize_width = resize_width
+        self.points_per_batch = points_per_batch
+        self.max_batches_per_query = max_batches_per_query
+
+        # Pre-compute grid points
+        num_frames, height, width = masks.shape
+        self.height, self.width = height, width
+        y, x = np.mgrid[0:height:grid_size, 0:width:grid_size]
+        y_resize, x_resize = y / (height - 1) * (resize_height - 1), x / (width - 1) * (resize_width - 1)
+
+        # Create all query-target pairs
+        self.samples = []
+        for query_idx in range(num_frames):
+            mask = masks[query_idx]
+            in_mask = mask[y, x] > 0.5
+
+            if in_mask.sum() == 0:
+                continue
+
+            # Get valid points for this query frame
+            query_points = np.stack([y_resize[in_mask], x_resize[in_mask]], axis=-1)
+            point_indices = np.where(in_mask.ravel())[0]
+
+            # Split points into batches
+            num_points = len(query_points)
+            if max_batches_per_query:
+                num_points = min(num_points, max_batches_per_query * points_per_batch)
+
+            for i in range(0, num_points, points_per_batch):
+                end_idx = min(i + points_per_batch, num_points)
+                batch_points = query_points[i:end_idx]
+                batch_indices = point_indices[i:end_idx]
+
+                self.samples.append({
+                    'query_idx': query_idx,
+                    'point_indices': batch_indices,
+                    'points': batch_points,
+                    'batch_start': i,
+                    'batch_end': end_idx
+                })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        query_idx = sample['query_idx']
+
+        # Create full track queries for all frames
+        num_frames = len(self.frame_names)
+        all_points = np.zeros((len(sample['points']), num_frames, 3), dtype=np.float32)
+        all_points[:, query_idx, 0] = query_idx  # time
+        all_points[:, query_idx, 1:] = sample['points']  # y, x coordinates
+
+        return {
+            'query_idx': query_idx,
+            'point_indices': sample['point_indices'],
+            'points': torch.from_numpy(all_points),
+            'batch_start': sample['batch_start'],
+            'batch_end': sample['batch_end']
+        }
+
+
+def collate_track_batch(batch):
+    """Collate function for track batches."""
+    query_indices = [item['query_idx'] for item in batch]
+    point_indices = [item['point_indices'] for item in batch]
+    points = torch.stack([item['points'] for item in batch])
+    batch_starts = [item['batch_start'] for item in batch]
+    batch_ends = [item['batch_end'] for item in batch]
+
+    return {
+        'query_indices': query_indices,
+        'point_indices': point_indices,
+        'points': points,
+        'batch_starts': batch_starts,
+        'batch_ends': batch_ends
+    }
+
+
+def process_batch_tracks(model, frames, batch_data, resize_width, resize_height, width, height, grid_size):
+    """Process a batch of track queries."""
+    points = batch_data['points'].to(frames.device)
+
+    with torch.inference_mode():
+        preds = model(frames, points)
+
+    tracks, occlusions, expected_dist = (
+        preds["tracks"].detach().cpu().numpy(),
+        preds["occlusion"].detach().cpu().numpy(),
+        preds["expected_dist"].detach().cpu().numpy(),
+    )
+
+    # Convert coordinates back to original size
+    tracks = transforms.convert_grid_coordinates(
+        tracks, (resize_width - 1, resize_height - 1), (width - 1, height - 1)
+    )
+
+    # Combine outputs
+    batch_outputs = []
+    for i in range(len(batch_data['query_indices'])):
+        query_idx = batch_data['query_indices'][i]
+        batch_tracks = tracks[i]
+        batch_occlusions = occlusions[i]
+        batch_expected_dist = expected_dist[i]
+
+        # Reconstruct original grid coordinates for this batch
+        # Get the global grid for this query frame
+        y_grid, x_grid = np.mgrid[0:height:grid_size, 0:width:grid_size]
+        y_grid = y_grid.astype(np.float32)
+        x_grid = x_grid.astype(np.float32)
+
+        # Get valid points for this query frame
+        mask = np.ones_like(y_grid, dtype=bool)  # We'll filter in the dataset
+        valid_y = y_grid.ravel()[batch_data['point_indices'][i]]
+        valid_x = x_grid.ravel()[batch_data['point_indices'][i]]
+
+        # Set query frame coordinates to original grid positions
+        batch_tracks[:, query_idx, 0] = valid_y  # y coordinates
+        batch_tracks[:, query_idx, 1] = valid_x  # x coordinates
+
+        combined = np.concatenate([
+            batch_tracks,
+            batch_occlusions[..., None],
+            batch_expected_dist[..., None]
+        ], axis=-1)
+
+        batch_outputs.append(combined)
+
+    return batch_outputs, batch_data['query_indices'], batch_data['point_indices']
 
 
 def read_video(folder_path):
@@ -58,6 +209,11 @@ def main():
         default="checkpoints",
         help="checkpoint dir",
     )
+    # New batch processing arguments
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size for data loader")
+    parser.add_argument("--num_workers", type=int, default=2, help="number of workers for data loader")
+    parser.add_argument("--points_per_batch", type=int, default=128, help="points per batch")
+    parser.add_argument("--max_batches_per_query", type=int, default=None, help="max batches per query frame")
     args = parser.parse_args()
 
     folder_path = args.image_dir
@@ -110,60 +266,64 @@ def main():
     frames = preprocess_frames(frames)[None]
     print(f"preprocessed {frames.shape=}")
 
-    y, x = np.mgrid[0:height:grid_size, 0:width:grid_size]
-    y_resize, x_resize = y / (height - 1) * (resize_height - 1), x / (width - 1) * (
-        resize_width - 1
+    # Create batch dataset and data loader
+    track_dataset = TrackBatchDataset(
+        frames=frames,
+        masks=masks,
+        frame_names=frame_names,
+        grid_size=grid_size,
+        resize_height=resize_height,
+        resize_width=resize_width,
+        points_per_batch=args.points_per_batch,
+        max_batches_per_query=args.max_batches_per_query
     )
 
-    for t in tqdm(range(num_frames), desc="query frames"):
-        name_t = os.path.splitext(frame_names[t])[0]
-        file_matches = glob.glob(f"{out_dir}/{name_t}_*.npy")
-        if len(file_matches) == num_frames:
-            print(f"Already computed tracks with query {t=} {name_t=}")
-            continue
+    data_loader = DataLoader(
+        track_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,  # Keep order for deterministic results
+        num_workers=args.num_workers,
+        collate_fn=collate_track_batch,
+        pin_memory=True
+    )
 
-        all_points = np.stack([t * np.ones_like(y), y_resize, x_resize], axis=-1)
-        mask = masks[t]
-        ### TODO add argument to mask points
-        in_mask = mask[y, x] > 0.5
-        all_points_t = all_points[in_mask]
-        print(f"{all_points.shape=} {all_points_t.shape=} {t=}")
-        outputs = []
-        if len(all_points_t) > 0:
-            num_chunks = max(1, len(all_points_t) // 128)
-            for points in tqdm(
-                np.array_split(all_points_t, axis=0, indices_or_sections=num_chunks),
-                leave=False,
-                desc="points",
-            ):
-                points = torch.from_numpy(points.astype(np.float32))[None].to(
-                    device
-                )  # Add batch dimension
-                with torch.inference_mode():
-                    preds = model(frames, points)
-                tracks, occlusions, expected_dist = (
-                    preds["tracks"][0].detach().cpu().numpy(),
-                    preds["occlusion"][0].detach().cpu().numpy(),
-                    preds["expected_dist"][0].detach().cpu().numpy(),
-                )
-                tracks = transforms.convert_grid_coordinates(
-                    tracks, (resize_width - 1, resize_height - 1), (width - 1, height - 1)
-                )
-                outputs.append(
-                    np.concatenate(
-                        [tracks, occlusions[..., None], expected_dist[..., None]], axis=-1
-                    )
-                )
-            outputs = np.concatenate(outputs, axis=0)
-        else:
-            outputs = np.zeros((0, num_frames, 4), dtype=np.float32)
+    print(f"Created dataset with {len(track_dataset)} batches")
 
-        for j in range(num_frames):
-            if j == t:
-                original_query_points = np.stack([x[in_mask], y[in_mask]], axis=-1)
-                outputs[:, j, :2] = original_query_points
-            name_j = os.path.splitext(frame_names[j])[0]
-            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs[:, j])
+    # Process batches
+    results_cache = {}  # Cache results by (query_idx, point_start, point_end)
+
+    for batch_data in tqdm(data_loader, desc="Processing batches"):
+        batch_outputs, query_indices, point_indices_list = process_batch_tracks(
+            model, frames, batch_data, resize_width, resize_height, width, height, grid_size
+        )
+
+        # Store results
+        for i, query_idx in enumerate(query_indices):
+            batch_outputs_i = batch_outputs[i]
+            point_indices = point_indices_list[i]
+
+            # Save results for each target frame
+            for target_idx in range(num_frames):
+                name_query = os.path.splitext(frame_names[query_idx])[0]
+                name_target = os.path.splitext(frame_names[target_idx])[0]
+                out_path = f"{out_dir}/{name_query}_{name_target}.npy"
+
+                # Load existing results or create new array
+                if os.path.exists(out_path):
+                    existing_results = np.load(out_path)
+                    # Extend array if needed
+                    if len(existing_results) < len(point_indices):
+                        extended_results = np.zeros((len(point_indices), num_frames, 4), dtype=np.float32)
+                        extended_results[:len(existing_results)] = existing_results
+                        existing_results = extended_results
+                else:
+                    existing_results = np.zeros((len(point_indices), num_frames, 4), dtype=np.float32)
+
+                # Update with new batch results
+                existing_results[:len(batch_outputs_i), target_idx] = batch_outputs_i[:, target_idx]
+                np.save(out_path, existing_results)
+
+    print("Batch processing completed!")
 
 
 if __name__ == "__main__":
