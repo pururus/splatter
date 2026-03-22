@@ -104,13 +104,6 @@ def main():
         default="checkpoints",
         help="checkpoint dir",
     )
-    # New batch processing arguments
-    parser.add_argument("--batch_size", type=int, default=4, help="batch size for data loader")
-    parser.add_argument("--num_workers", type=int, default=2, help="number of workers for data loader")
-    parser.add_argument("--points_per_batch", type=int, default=128, help="points per batch")
-    parser.add_argument("--max_batches_per_query", type=int, default=None, help="max batches per query frame")
-    parser.add_argument("--max_video_frames", type=int, default=None, help="truncate video to this many frames before computing tracks")
-    parser.add_argument("--temporal_window", type=int, default=None, help="number of frames to process in each track window; if None uses full sequence")
     args = parser.parse_args()
 
     folder_path = args.image_dir
@@ -176,11 +169,11 @@ def main():
     )
 
     outputs_per_frame = [np.zeros((len(all_points), num_frames, 4), dtype=np.float32) for _ in range(num_frames)]
-    for t in range(num_frames):
+    for t in tqdm(range(num_frames), desc=f"Processing time {t}/{num_frames}"):
         name_t = os.path.splitext(frame_names[t])[0]
         outputs = []
         
-        for points in tqdm(points_loader, desc=f"Processing frame {t}/{num_frames}"):
+        for points in tqdm(points_loader, desc=f"Processing points chunks"):
             points = points.to(device) * t 
             batch_output = []
             
