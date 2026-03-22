@@ -29,7 +29,7 @@ class PointsDataset(torch.utils.data.Dataset):
         return len(self.point_chunks)
 
     def __getitem__(self, idx):
-        points = self.point_chunks[idx].copy()
+        points = self.point_chunks[idx]
         points[:, 0] = float(idx)
 
         return torch.from_numpy(points.astype(np.float32))
@@ -49,8 +49,8 @@ class FramesDataset(torch.utils.data.Dataset):
         return len(self.frame_chunks)
 
     def __getitem__(self, idx):
-        frame = self.frame_chunks[idx].copy()
-        return torch.from_numpy(frame.astype(np.float32))
+        frame = self.frame_chunks[idx]
+        return frame
 
 def read_video(folder_path):
     frame_paths = sorted(glob.glob(os.path.join(folder_path, "*")))
@@ -95,6 +95,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
     parser.add_argument("--chunk_size", type=int, default=128, help="chunk size for points")
     parser.add_argument("--window_size", type=int, default=128, help="window size for frames")
+    parser.add_argument("--first_frame", type=int, default=None, help="chunk size for points")
+    parser.add_argument("--last_frame", type=int, default=None, help="window size for frames")
     parser.add_argument(
         "--model_type", type=str, choices=["tapir", "bootstapir"], help="model type"
     )
@@ -148,15 +150,18 @@ def main():
     num_frames, height, width = video.shape[0:3]
     
     frames = media.resize_video(video, (resize_height, resize_width))
+    if args.last_frame is not None:
+        frames = frames[:args.last_frame]
+    if args.first_frame is not None:
+        frames = frames[args.first_frame:]
     frames = torch.from_numpy(frames)
     frames = preprocess_frames(frames)
-
 
     y, x = np.mgrid[0:height:grid_size, 0:width:grid_size]
     y_resize = y / (height - 1) * (resize_height - 1)
     x_resize = x / (width - 1) * (resize_width - 1)
 
-    all_points = np.stack([np.zeros_like(y, dtype=np.float32), y_resize, x_resize], axis=-1)
+    all_points = np.stack([np.zeros_like(y, dtype=np.float32), y_resize, x_resize], axis=-1).reshape(-1, 3)
     
     points_dataset = PointsDataset(all_points, chunk_size=args.chunk_size)
     frames_dataset = FramesDataset(frames, window_size=args.window_size)
@@ -174,15 +179,15 @@ def main():
         outputs = []
         
         for points in tqdm(points_loader, desc=f"Processing points chunks"):
-            points = points.to(device) * t 
+            t_points = points.to(device) * torch.tensor([t, 1, 1], device=device) 
             batch_output = []
             
             for frames_chunk in tqdm(frames_dataset, desc=f"Processing frames for frame {t}"):
                 frames_chunk = frames_chunk.to(device)
-                frames_chunk = frames_chunk.unsqueeze(0).repeat(points.shape[0], 1, 1, 1, 1)
+                frames_chunk = frames_chunk.unsqueeze(0).repeat(t_points.shape[0], 1, 1, 1, 1)
 
                 with torch.inference_mode():
-                    preds = model(frames_chunk, points)
+                    preds = model(frames_chunk, t_points)
 
                 tracks = preds["tracks"].detach().cpu().numpy()
                 tracks = transforms.convert_grid_coordinates(
