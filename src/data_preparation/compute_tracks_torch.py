@@ -201,12 +201,11 @@ def main():
         outputs.append(np.concatenate(batch_output, axis=2)) 
         outputs = np.concatenate(outputs, axis=0)
 
-    for t in range(num_frames):
         for j in range(num_frames):
             name_j = os.path.splitext(frame_names[j])[0]
             if j == t:
-                outputs_per_frame[t][:, j, :2] = np.stack([x.reshape(-1), y.reshape(-1)], axis=-1)
-            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs_per_frame[t][:, j])
+                outputs[t][:, j, :2] = np.stack([x.reshape(-1), y.reshape(-1)], axis=-1)
+            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs[t][:, j])
             
 if __name__ == "__main__":
     main()
