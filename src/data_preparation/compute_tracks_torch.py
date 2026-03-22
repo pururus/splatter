@@ -156,12 +156,15 @@ def main():
         frames = frames[args.first_frame:]
     frames = torch.from_numpy(frames)
     frames = preprocess_frames(frames)
+    
+    num_frames = frames.shape[0]
 
     y, x = np.mgrid[0:height:grid_size, 0:width:grid_size]
     y_resize = y / (height - 1) * (resize_height - 1)
     x_resize = x / (width - 1) * (resize_width - 1)
 
     all_points = np.stack([np.zeros_like(y, dtype=np.float32), y_resize, x_resize], axis=-1).reshape(-1, 3)
+    print("Points shape:", all_points.shape)
     
     points_dataset = PointsDataset(all_points, chunk_size=args.chunk_size)
     frames_dataset = FramesDataset(frames, window_size=args.window_size)
@@ -173,7 +176,6 @@ def main():
         num_workers=args.num_workers if hasattr(args, 'num_workers') else 0,
     )
 
-    outputs_per_frame = [np.zeros((len(all_points), num_frames, 4), dtype=np.float32) for _ in range(num_frames)]
     for t in tqdm(range(num_frames), desc=f"Processing time {t}/{num_frames}"):
         name_t = os.path.splitext(frame_names[t])[0]
         outputs = []
@@ -198,9 +200,10 @@ def main():
                 
                 batch_output.append(np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1))
             
-        outputs.append(np.concatenate(batch_output, axis=2)) 
+            outputs.append(np.concatenate(batch_output, axis=2)) 
         outputs = np.concatenate(outputs, axis=0)
 
+        print("Outputs has  shape:", outputs.shape)
         for j in range(num_frames):
             name_j = os.path.splitext(frame_names[j])[0]
             if j == t:
