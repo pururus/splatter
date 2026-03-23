@@ -418,7 +418,7 @@ class FragTrainer:
             end=self.num_imgs+self.base_idx, 
             step=1, )
         grid_size = int(64 / (self.args.video_flow_margin / 0.25))
-        extended_tracks_3d, extended_colors = self.video_3d_flow.extend_track3d(tracks_3d, margin=self.args.video_flow_margin, grid_size=grid_size, start=self.base_idx)
+        extended_tracks_3d, extended_colors = self.video_3d_flow.extend_track3d(tracks_3d, margin=self.args.video_flow_margin, grid_size=grid_size)
         # extended_tracks_3d, extended_colors = self.video_3d_flow.extend_track3d(tracks_3d, margin=0.75)
         tracks_3d = torch.cat([extended_tracks_3d, tracks_3d], dim=0)
         colors = torch.cat([extended_colors, colors], dim=0)

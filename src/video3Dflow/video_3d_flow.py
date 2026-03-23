@@ -164,7 +164,7 @@ class Video3DFlow:
     def extend_track3d(self, track3d, grid_size=64, margin=0.25, start=0):
         # track3d: (N, T, 3)
         # extend with the first frame and last frame
-        H, W = self.depths[0].shape
+        H, W = self.depths[start].shape
         image_size_wh = torch.tensor([W, H], device=track3d.device)[None]
         points_3d_seq, points_colors = [], []
 
