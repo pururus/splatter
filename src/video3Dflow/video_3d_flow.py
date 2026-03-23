@@ -161,12 +161,15 @@ class Video3DFlow:
 
     
     # def extend_track3d(self, track3d, grid_size=16, margin=0.5):
-    def extend_track3d(self, track3d, grid_size=64, margin=0.25):
+    def extend_track3d(self, track3d, grid_size=64, margin=0.25, start=0):
         # track3d: (N, T, 3)
         # extend with the first frame and last frame
         H, W = self.depths[0].shape
         image_size_wh = torch.tensor([W, H], device=track3d.device)[None]
         points_3d_seq, points_colors = [], []
+
+        first_idx = start
+        last_idx = start + track3d.shape[1] - 1
 
         #################### add left frame
         pixel_coordinates = torch.meshgrid(
@@ -178,7 +181,7 @@ class Video3DFlow:
 
         # (T, 1, H, W), (T, 1, N, 2) -> (T, 1, 1, N)
         point_depths = torch.nn.functional.grid_sample(
-            self.get_depth(0)[None,None],
+            self.get_depth(first_idx)[None,None],
             points_2d[None,None],
             align_corners=True,
             padding_mode="border",
@@ -186,14 +189,14 @@ class Video3DFlow:
         point_depths = (point_depths - self.depths_min) / (self.depths_max - self.depths_min) * (self.depth_range_max - self.depth_range_min) + self.depth_range_min
 
         cur_points_colors = torch.nn.functional.grid_sample(
-            self.get_image(0)[None].permute(0, 3, 1, 2),
+            self.get_image(first_idx)[None].permute(0, 3, 1, 2),
             points_2d[None,None],
             align_corners=True,
             padding_mode="border",
         )[0, :, 0].permute(1,0)
 
         is_in_masks = (torch.nn.functional.grid_sample(
-                self.get_mask(0)[None, None],
+                self.get_mask(first_idx)[None, None],
                 points_2d[None,None],
                 align_corners=True,
             )[0, 0, 0]
@@ -214,9 +217,8 @@ class Video3DFlow:
         pixel_coordinates = torch.stack(pixel_coordinates, dim=-1).reshape(-1, 2)
         points_2d = (pixel_coordinates - image_size_wh / 2) / (image_size_wh / 2)
 
-        num_frames = track3d.shape[1]
         point_depths = torch.nn.functional.grid_sample(
-            self.get_depth(num_frames-1)[None,None],
+            self.get_depth(last_idx)[None,None],
             points_2d[None,None],
             align_corners=True,
             padding_mode="border",
@@ -224,14 +226,14 @@ class Video3DFlow:
         point_depths = (point_depths - self.depths_min) / (self.depths_max - self.depths_min) * (self.depth_range_max - self.depth_range_min) + self.depth_range_min
 
         cur_points_colors = torch.nn.functional.grid_sample(
-            self.get_image(num_frames-1)[None].permute(0, 3, 1, 2),
+            self.get_image(last_idx)[None].permute(0, 3, 1, 2),
             points_2d[None,None],
             align_corners=True,
             padding_mode="border",
         )[0, :, 0].permute(1,0)
 
         is_in_masks = (torch.nn.functional.grid_sample(
-                self.get_mask(num_frames-1)[None, None],
+                self.get_mask(last_idx)[None, None],
                 points_2d[None,None],
                 align_corners=True,
             )[0, 0, 0]

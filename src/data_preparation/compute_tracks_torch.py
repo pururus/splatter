@@ -188,6 +188,7 @@ def main():
                 frames_chunk = frames_chunk.to(device)
                 frames_chunk = frames_chunk.unsqueeze(0).repeat(t_points.shape[0], 1, 1, 1, 1)
 
+                print(frames_chunk.shape)
                 with torch.inference_mode():
                     preds = model(frames_chunk, t_points)
 
@@ -199,16 +200,17 @@ def main():
                 expected_dist = preds["expected_dist"].detach().cpu().numpy()
                 
                 batch_output.append(np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1))
+                print("batch shape", np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1).shape)
             
-            outputs.append(np.concatenate(batch_output, axis=2)) 
+            outputs.append(np.concatenate(batch_output, axis=1).reshape(tracks.shape[0] * tracks.shape[1], num_frames, 4)) 
         outputs = np.concatenate(outputs, axis=0)
 
         print("Outputs has  shape:", outputs.shape)
         for j in range(num_frames):
             name_j = os.path.splitext(frame_names[j])[0]
             if j == t:
-                outputs[t][:, j, :2] = np.stack([x.reshape(-1), y.reshape(-1)], axis=-1)
-            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs[t][:, j])
+                outputs[:, j, :2] = np.stack([x.reshape(-1), y.reshape(-1)], axis=-1)
+            np.save(f"{out_dir}/{name_t}_{name_j}.npy", outputs[:, j])
             
 if __name__ == "__main__":
     main()
