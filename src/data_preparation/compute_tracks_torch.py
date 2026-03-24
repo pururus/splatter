@@ -152,8 +152,10 @@ def main():
     frames = media.resize_video(video, (resize_height, resize_width))
     if args.last_frame is not None:
         frames = frames[:args.last_frame]
+        frame_names = frame_names[:args.last_frame]
     if args.first_frame is not None:
         frames = frames[args.first_frame:]
+        frame_names = frame_names[args.first_frame:]
     frames = torch.from_numpy(frames)
     frames = preprocess_frames(frames)
     
