@@ -304,7 +304,7 @@ class FragTrainer:
         frames_folder = os.path.join(self.seq_dir, "images")
         mask_folder = os.path.join(self.seq_dir, "masks")
         from video3Dflow.video_3d_flow import Video3DFlow
-        self.video_3d_flow = Video3DFlow(depth_folder, tracking_folder, frames_folder, mask_folder, self.base_idx, self.num_imgs+self.base_idx)
+        self.video_3d_flow = Video3DFlow(depth_folder, tracking_folder, frames_folder, mask_folder)
         self.video_3d_flow.setup()
         tracks_3d, visibles, invisibles, confidences, colors = self.video_3d_flow.get_tracks_3d(
             num_samples=10000, 
