@@ -1261,12 +1261,12 @@ class FragTrainer:
         print()
 
 
-    def render_video_nvs(self, step=0, save_frames=False, phi=math.pi, theta=math.pi, radius=0.05):
+    def render_video_nvs(self, step=0, save_frames=False, x=1.0, y=0.0, z=0.0, filename=None):
         ### render image / depth / dinov2
         images, depths = [], []
         dinos = []
         for id in range(self.num_imgs):
-            camera_position = torch.tensor([[radius*math.cos(phi)*math.cos(theta), radius*math.sin(phi)*math.cos(theta), radius*math.sin(theta)]], device=self.device)
+            camera_position = torch.tensor([[x, y, z]], device=self.device)
             camra_rotation = look_at_rotation(camera_position, at=((0,0,2.5),), device=self.device)
             c2w = torch.cat([camra_rotation[0], camera_position.T], dim=1).cpu().numpy()
             c2w = np.concatenate([c2w, np.array([[0,0,0,1]])], axis=0)
@@ -1311,7 +1311,10 @@ class FragTrainer:
             for i, img in enumerate(images):
                 imageio.imwrite(os.path.join(save_dir, f'{i:05d}.png'), img)
         
-        imageio.mimwrite(os.path.join(self.out_dir, 'vis', 'render_{:06d}_nvs.mp4'.format(step)),
+        if filename is None:
+            filename = 'render_{:06d}_nvs.mp4'.format(step)
+            
+        imageio.mimwrite(os.path.join(self.out_dir, 'vis', filename),
                             images,
                             quality=8, fps=10)
         
