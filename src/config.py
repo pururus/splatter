@@ -1,3 +1,5 @@
+from html import parser
+
 import configargparse
 
 
@@ -88,6 +90,10 @@ def config_parser():
     parser.add_argument('--i_cache', type=int, default=20000, help='frequency for caching current flow predictions')
 
     parser.add_argument("-f", "--fff", help="a dummy argument to fool ipython", default="1")
+    
+    parser.add_argument("--x", type=int, required=False, help="x for generation")
+    parser.add_argument("--y", type=int, required=False, help="y for generation")
+    parser.add_argument("--z", type=int, required=False, help="z for generation")
 
     args = parser.parse_args()
     return args

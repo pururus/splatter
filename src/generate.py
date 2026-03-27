@@ -64,16 +64,11 @@ def generate(args, x, y, z):
 
 if __name__ == '__main__':
     args = config_parser()
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--x", type=int, required=True, help="image dir")
-    parser.add_argument("--y", type=int, required=True, help="mask dir")
-    parser.add_argument("--z", type=int, required=True, help="out dir")
-    t_args = parser.parse_args()
 
     if args.distributed:
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
 
-    generate(args, t_args.x, t_args.y, t_args.z)
+    generate(args, args.x, args.y, args.z)
 
