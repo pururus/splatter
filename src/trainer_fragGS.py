@@ -940,7 +940,7 @@ class FragTrainer:
 
 
     def load_model(self, path: Path = None) -> None:
-        data_list = torch.load(path)
+        data_list = torch.load(path, weights_only=False)
         for k, v in data_list.items():
             print(f"Loaded {k} from checkpoint")
             # get arrtibute from model
