@@ -27,7 +27,7 @@ class GSSimpleDataset(Dataset):
         self.seq_dir = args.data_dir
         self.seq_name = args.seq_name
         # self.img_dir = os.path.join(self.seq_dir, 'JPEGImages/480p', self.seq_name)
-        self.img_dir = "/mnt/sda/syt/dataset/laptop_10211/processed/images"
+        self.img_dir = os.path.join(self.data_dir, 'images')
         self.flow_dir = os.path.join(self.seq_dir, 'raft_exhaustive')
         img_names = sorted(os.listdir(self.img_dir))
         if self.args.num_imgs < 0:
