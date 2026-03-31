@@ -204,7 +204,7 @@ def main():
                 batch_output.append(np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1))
                 print("batch shape", np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1).shape)
             
-            outputs.append(np.concatenate(batch_output, axis=1).reshape(tracks.shape[0] * tracks.shape[1], num_frames, 4)) 
+            outputs.append(np.concatenate(batch_output, axis=2).reshape(tracks.shape[0] * tracks.shape[1], num_frames, 4)) 
         outputs = np.concatenate(outputs, axis=0)
 
         print("Outputs has  shape:", outputs.shape)
