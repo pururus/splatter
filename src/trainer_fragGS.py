@@ -1261,13 +1261,15 @@ class FragTrainer:
         print()
 
 
-    def render_video_nvs(self, step=0, save_frames=False, x=1.0, y=0.0, z=0.0, filename=None):
+    def render_video_nvs(self, step=0, save_frames=False, x=1.0, y=0.0, z=0.0, filename=None, at=None):
         ### render image / depth / dinov2
         images, depths = [], []
         dinos = []
         for id in range(self.num_imgs):
+            if at is None:
+                at = ((0,0,2.5),)
             camera_position = torch.tensor([[x, y, z]], device=self.device)
-            camra_rotation = look_at_rotation(camera_position, at=((0,0,2.5),), device=self.device)
+            camra_rotation = look_at_rotation(camera_position, at=at, device=self.device)
             c2w = torch.cat([camra_rotation[0], camera_position.T], dim=1).cpu().numpy()
             c2w = np.concatenate([c2w, np.array([[0,0,0,1]])], axis=0)
             camera = construct_canonical_camera(width=self.w, height=self.h, c2w=c2w)

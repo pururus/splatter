@@ -165,7 +165,7 @@ def main():
     y_resize = y / (height - 1) * (resize_height - 1)
     x_resize = x / (width - 1) * (resize_width - 1)
 
-    all_points = np.stack([np.zeros_like(y, dtype=np.float32), y_resize, x_resize], axis=-1).reshape(-1, 3)
+    all_points = np.stack([np.ones_like(y, dtype=np.float32), y_resize, x_resize], axis=-1).reshape(-1, 3)
     print("Points shape:", all_points.shape)
     
     points_dataset = PointsDataset(all_points, chunk_size=args.chunk_size)
@@ -182,11 +182,11 @@ def main():
         name_t = os.path.splitext(frame_names[t])[0]
         outputs = []
         
-        for points in tqdm(points_loader, desc=f"Processing points chunks"):
+        for points in points_loader:
             t_points = points.to(device) * torch.tensor([t, 1, 1], device=device) 
             batch_output = []
             
-            for frames_chunk in tqdm(frames_dataset, desc=f"Processing frames for frame {t}"):
+            for frames_chunk in frames_dataset:
                 frames_chunk = frames_chunk.to(device)
                 frames_chunk = frames_chunk.unsqueeze(0).repeat(t_points.shape[0], 1, 1, 1, 1)
 
@@ -203,7 +203,9 @@ def main():
                 
                 batch_output.append(np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1))
                 print("batch shape", np.concatenate([tracks, occlusions[..., None], expected_dist[..., None]], axis=-1).shape)
-            
+                assert np.concatenate([np.ones((t_points.shape[0], t_points.shape[1], 1)) * t, tracks[:, :, -1, :]], axis=2).shape == t_points.shape
+                t_points = torch.from_numpy(np.concatenate([np.ones((t_points.shape[0], t_points.shape[1], 1)) * t, tracks[:, :, -1, :]], axis=2).astype(np.float32)).to(device)
+                
             outputs.append(np.concatenate(batch_output, axis=2).reshape(tracks.shape[0] * tracks.shape[1], num_frames, 4)) 
         outputs = np.concatenate(outputs, axis=0)
 
