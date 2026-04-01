@@ -534,8 +534,8 @@ class FragTrainer:
         predicted_track_2d = util.denormalize_coords(predicted_track_gs[...,:2], self.h, self.w)  # [1, h, w, 2]
         # resize_h, resize_w = math.ceil(self.h / 4), math.ceil(self.w / 4)
         # load gt track_2d
-        query_tracks_2d = self.video_3d_flow.load_target_tracks(ids1.item(), [ids1.item()])[:, 0, :2]  # [NumPoints, 2]
-        target_tracks = self.video_3d_flow.load_target_tracks(ids1.item(), [ids2.item()], dim=0)  # [NumT, NumPoints, 4]
+        query_tracks_2d = self.video_3d_flow.load_target_tracks(ids1.item() + self.base_idx, [ids1.item() + self.base_idx])[:, 0, :2]  # [NumPoints, 2]
+        target_tracks = self.video_3d_flow.load_target_tracks(ids1.item() + self.base_idx, [ids2.item() + self.base_idx], dim=0)  # [NumT, NumPoints, 4]
         query_tracks_2d = query_tracks_2d.to(self.device)
         target_tracks = target_tracks.to(self.device)
 
